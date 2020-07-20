@@ -11,6 +11,8 @@ import torchvision
 import time
 import h5py
 from audio_records import EpicAudioRecord
+import matplotlib
+from SpecAugment import spec_augment_pytorch
 import datetime
 import pickle
 from torch.utils.data.dataset import Dataset
@@ -37,11 +39,14 @@ parser.add_argument('--print_freq', default=10, type=int, help="print stats freq
 parser.add_argument('--eval_freq', default=5, type=int, help="val evaluation frequency")
 parser.add_argument('--ngpus', default=1, type=int, help='number of gpus')
 parser.add_argument('--n_fft', default=2048, type=float, help='size of padded windowed signal in spectrogram')
-parser.add_argument('--window_size', default=20, type=float, help='size of windowed signal in spectrogram without padding')
-parser.add_argument('--hop_length', default=10, type=float, help='STFT hop length')
+parser.add_argument('--window_size', default=10, type=float, help='size of windowed signal in spectrogram without padding')
+parser.add_argument('--hop_length', default=5, type=float, help='STFT hop length')
 parser.add_argument('--sampling_rate', default=24000, type=float, help='audio sampling length')
 parser.add_argument('--pretrained', default=True, type=bool, help='Imagenet pretraining')
 parser.add_argument('--augment', default=True, type=bool, help='Audio data augmentations')
+parser.add_argument('--time_warp', default=20, type=int, help='Time warping parameter')
+parser.add_argument('--freq_mask', default=30, type=int, help='Frequency masking parameter')
+parser.add_argument('--time_mask', default=30, type=int, help='Time masking parameter')
 parser.add_argument('--mask_size', default=10, type=int, help='Size of mask for frequency and time masking')
 parser.add_argument('--num_mels', default=128, type=int, help='Number of mel frequency bins')
 parser.add_argument('--label_type', default='full', type=str, help='Label type: full, verb, noun')
@@ -251,14 +256,13 @@ def my_collate(batch):
     return [data, targets]
 
 class AudioDataset(Dataset):
-    def __init__(self, audio_files, file_list, window_size, step_size, n_fft, label_type = 'full',  sampling_rate = 24000, mode = 'train', im_transform = None, audio_transform = None):
+    def __init__(self, audio_files, file_list, window_size, step_size, n_fft, label_type = 'full',  sampling_rate = 24000, mode = 'train', im_transform = None):
         if not os.path.exists(audio_files) or not os.path.exists(file_list):
             raise Exception('path does not exist')
         self.hdf5_files = audio_files
         self.audio_files = None
         self.file_list = file_list
         self.im_transform = im_transform
-        self.audio_transform = audio_transform
         self.sampling_rate = sampling_rate
         self.window_size = window_size
         self.step_size = step_size
@@ -336,8 +340,10 @@ class AudioDataset(Dataset):
         spec = self.im_transform(spec) 
         
         #augment
-        if self.audio_transform is not None:
-            spec = self.audio_transform(spec)
+        if args.augment and self.mode == 'train':
+            spec = spec_augment_pytorch.spec_augment(spec, 
+                        time_warping_para = args.time_warp, frequency_masking_para = args.freq_mask, 
+                        time_masking_para = args.time_mask)
        
         if self.label_type == 'full':
             return spec, record.label
@@ -361,12 +367,6 @@ image_transform = torchvision.transforms.Compose([
     transforms.ToTensor(),
 ])
 
-if args.augment:
-    audio_transform = nn.Sequential(torchaudio.transforms.FrequencyMasking(10), 
-                                torchaudio.transforms.TimeMasking(10))
-else:
-    audio_transfroms = None
-
     
 TRAIN = AudioDataset(args.data_path, 
                      train_csv, 
@@ -376,8 +376,7 @@ TRAIN = AudioDataset(args.data_path,
                      n_fft = 511,
                      label_type = args.label_type ,
                      mode = 'train',
-                     im_transform=image_transform,
-                     audio_transform = audio_transform)
+                     im_transform=image_transform)
 
 TRAIN_LOADER = DataLoader(dataset=TRAIN, 
                           batch_size=args.batch_size, 
@@ -394,8 +393,7 @@ VAL = AudioDataset(args.data_path,
                    n_fft = 511,
                    label_type = args.label_type,
                    mode = 'val',
-                   im_transform=image_transform,
-                   audio_transform = None)
+                   im_transform=image_transform)
 
 VAL_LOADER = DataLoader(dataset=VAL, 
                         batch_size=args.batch_size, 
