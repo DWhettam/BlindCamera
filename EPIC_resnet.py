@@ -279,9 +279,12 @@ class AudioDataset(Dataset):
         nperseg = int(round(self.window_size * self.sampling_rate / 1e3))
         noverlap = int(round(self.step_size * self.sampling_rate / 1e3))
     
-
         spec = librosa.stft(audio_array, n_fft=511, hop_length=noverlap, win_length = nperseg)
-        spec = np.log(np.real(spec * np.conj(spec)) + eps)        
+        #spec = np.log(np.real(spec * np.conj(spec)) + eps)
+        magnitude = np.abs(spec)**2
+        spec = librosa.filters.mel(sr=24000, n_fft=511, n_mels=128)
+        spec = spec.dot(magnitude)
+        spec = librosa.power_to_db(spec, ref=np.max)
  
         return Image.fromarray(spec)
 
@@ -408,6 +411,19 @@ if args.pretrained:
         weights = torch.nn.Parameter(torch.mean(model._modules['conv1'].weight, 1, True))
         model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         model.conv1.weight = weights
+
+num_ftrs = model.fc.in_features
+
+if args.label_type == 'verb':
+    model.fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(num_ftrs, 97)
+    )
+elif args.label_type == 'noun':
+    model.fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(num_ftrs, 300)
+    )
 
 if torch.cuda.device_count() > 1:
     print("Let's use", torch.cuda.device_count(), "GPUs!")

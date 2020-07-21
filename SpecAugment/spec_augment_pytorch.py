@@ -97,14 +97,14 @@ def spec_augment(mel_spectrogram, time_warping_para=80, frequency_masking_para=2
         f = np.random.uniform(low=0.0, high=frequency_masking_para)
         f = int(f)
         f0 = random.randint(0, v-f)
-        warped_mel_spectrogram[:, f0:f0+f, :] = 0
+        warped_mel_spectrogram[:, f0:f0+f, :] = torch.mean(warped_mel_spectrogram).item()
 
     # Step 3 : Time masking
     for i in range(time_mask_num):
         t = np.random.uniform(low=0.0, high=time_masking_para)
         t = int(t)
         t0 = random.randint(0, tau-t)
-        warped_mel_spectrogram[:, :, t0:t0+t] = 0
+        warped_mel_spectrogram[:, :, t0:t0+t] = torch.mean(warped_mel_spectrogram).item()
 
     return warped_mel_spectrogram
 
