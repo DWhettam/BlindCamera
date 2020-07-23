@@ -17,6 +17,7 @@ import datetime
 import pickle
 from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import torchvision.models as models
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,8 +37,9 @@ parser.add_argument('--data_path', default='/mnt/storage/home/qc19291/scratch/EP
 parser.add_argument('--epochs', default = 32, type=int, help='number of epochs')
 parser.add_argument('--batch_size', default = 32, type=int, help='Batch size')
 parser.add_argument('--print_freq', default=10, type=int, help="print stats frequency")
-parser.add_argument('--eval_freq', default=5, type=int, help="val evaluation frequency")
+parser.add_argument('--eval_freq', default=1, type=int, help="val evaluation frequency")
 parser.add_argument('--ngpus', default=1, type=int, help='number of gpus')
+parser.add_argument('--learning_rate', default=0.0001, type=float, help='Learning Rate')
 parser.add_argument('--n_fft', default=2048, type=float, help='size of padded windowed signal in spectrogram')
 parser.add_argument('--window_size', default=10, type=float, help='size of windowed signal in spectrogram without padding')
 parser.add_argument('--hop_length', default=5, type=float, help='STFT hop length')
@@ -63,7 +65,9 @@ train_csv = args.annotation_path + 'EPIC_100_train.pkl'
 #test_csv = args.data_path + 'evaluation_setup/fold1_itest.csv'
 evaluate_csv = args.annotation_path + 'EPIC_100_validation.pkl'
 
-def validate(net, checkpoint=None):
+writer = SummaryWriter('runs/EPIC_baselines')
+
+def validate(net, epoch, checkpoint=None):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -128,7 +132,10 @@ def validate(net, checkpoint=None):
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
-
+            
+            writer.add_scalar('loss/val', losses.val, epoch * len(TRAIN) + batch_idx)
+            writer.add_scalar('error/val', top1.val, epoch * len(TRAIN) + batch_idx)
+        
             if batch_idx % args.print_freq == 0:
                 if args.label_type != 'full':
                     print('Validate:[{0}/{1}]\t'
@@ -279,10 +286,10 @@ class AudioDataset(Dataset):
         nperseg = int(round(self.window_size * self.sampling_rate / 1e3))
         noverlap = int(round(self.step_size * self.sampling_rate / 1e3))
     
-        spec = librosa.stft(audio_array, n_fft=511, hop_length=noverlap, win_length = nperseg)
+        spec = librosa.stft(audio_array, n_fft=512, hop_length=noverlap, win_length = nperseg)
         #spec = np.log(np.real(spec * np.conj(spec)) + eps)
         magnitude = np.abs(spec)**2
-        spec = librosa.filters.mel(sr=24000, n_fft=511, n_mels=128)
+        spec = librosa.filters.mel(sr=24000, n_fft=512, n_mels=128)
         spec = spec.dot(magnitude)
         spec = librosa.power_to_db(spec, ref=np.max)
  
@@ -376,7 +383,7 @@ TRAIN = AudioDataset(args.data_path,
                      sampling_rate = args.sampling_rate, 
                      window_size = args.window_size, 
                      step_size = args.hop_length, 
-                     n_fft = 511,
+                     n_fft = 512,
                      label_type = args.label_type ,
                      mode = 'train',
                      im_transform=image_transform)
@@ -385,7 +392,7 @@ TRAIN_LOADER = DataLoader(dataset=TRAIN,
                           batch_size=args.batch_size, 
                           shuffle=True, 
                           drop_last = True, 
-                          num_workers=8,
+                          num_workers=16,
                           pin_memory=True)
 
 VAL = AudioDataset(args.data_path, 
@@ -393,7 +400,7 @@ VAL = AudioDataset(args.data_path,
                    sampling_rate = args.sampling_rate, 
                    window_size = args.window_size, 
                    step_size = args.hop_length, 
-                   n_fft = 511,
+                   n_fft = 512,
                    label_type = args.label_type,
                    mode = 'val',
                    im_transform=image_transform)
@@ -402,7 +409,7 @@ VAL_LOADER = DataLoader(dataset=VAL,
                         batch_size=args.batch_size, 
                         shuffle = False, 
                         drop_last = True, 
-                        num_workers=8,
+                        num_workers=16,
                         pin_memory=True)
 
 model = models.resnet50(pretrained=args.pretrained)
@@ -433,7 +440,7 @@ if torch.cuda.device_count() > 1:
 model.to(device)
 model.train()
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
 
 val_losses = []
 train_losses = []
@@ -518,7 +525,10 @@ for epoch in range(args.epochs):  # loop over the dataset multiple times
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-
+        
+        writer.add_scalar('loss/train', losses.val, epoch * len(TRAIN) + batch_idx)
+        writer.add_scalar('error/train', top1.val, epoch * len(TRAIN) + batch_idx)
+                          
         if batch_idx % args.print_freq == 0:
             if args.label_type != 'full':
                 print('Epoch: [{0}][{1}/{2}]\t'
@@ -551,8 +561,8 @@ for epoch in range(args.epochs):  # loop over the dataset multiple times
     train_losses.append(losses.avg)
     train_errors.append(top1.avg)
     if epoch % args.eval_freq == 0:
-        validate(model) 
+        validate(model, epoch) 
         model.train()
-
+writer.close()
 print('Finished Training')
 
