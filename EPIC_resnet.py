@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
+import json
 import torch
 import torchaudio
 import torchvision
@@ -27,6 +28,7 @@ import random
 import os
 from torchvision import transforms
 from torch.nn.utils.rnn import pack_sequence
+from torch.optim.lr_scheduler import MultiStepLR
 import argparse
 
 parser = argparse.ArgumentParser(description='BlindCamera_args')
@@ -46,12 +48,15 @@ parser.add_argument('--hop_length', default=5, type=float, help='STFT hop length
 parser.add_argument('--sampling_rate', default=24000, type=float, help='audio sampling length')
 parser.add_argument('--pretrained', default=True, type=bool, help='Imagenet pretraining')
 parser.add_argument('--augment', default=True, type=bool, help='Audio data augmentations')
+parser.add_argument('--scheduler', default=False, type=bool, help='Audio data augmentations')
 parser.add_argument('--time_warp', default=20, type=int, help='Time warping parameter')
 parser.add_argument('--freq_mask', default=30, type=int, help='Frequency masking parameter')
 parser.add_argument('--time_mask', default=30, type=int, help='Time masking parameter')
 parser.add_argument('--mask_size', default=10, type=int, help='Size of mask for frequency and time masking')
+parser.add_argument('--mask_num', default=1, type=int, help='Number of time and frequency masks')
 parser.add_argument('--num_mels', default=128, type=int, help='Number of mel frequency bins')
-parser.add_argument('--label_type', default='full', type=str, help='Label type: full, verb, noun')
+parser.add_argument('--label_type', default='verb', type=str, choices=['verb', 'noun'], help='Label type: verb, noun')
+parser.add_argument('--ops', default='SGD', type=str, choices=['SGD','Adam','AdamW'], help='Which optimiser to be used')
 
 args = parser.parse_args()
 print(args)
@@ -65,7 +70,18 @@ train_csv = args.annotation_path + 'EPIC_100_train.pkl'
 #test_csv = args.data_path + 'evaluation_setup/fold1_itest.csv'
 evaluate_csv = args.annotation_path + 'EPIC_100_validation.pkl'
 
-writer = SummaryWriter('runs/EPIC_baselines')
+
+previous_runs = os.listdir('runs/EPIC_baselines')
+if len(previous_runs) == 0:
+    run_number = 1
+else:
+    run_number = max([int(s.split('run_')[1]) for s in previous_runs]) + 1
+
+logdir = 'run_%02d' % run_number
+writer = SummaryWriter(os.path.join('runs/EPIC_baselines', logdir))
+
+with open(os.path.join(os.path.join('runs/EPIC_baselines', logdir), 'args.txt'), 'w') as f:
+    json.dump(args.__dict__, f, indent=2)
 
 def validate(net, epoch, checkpoint=None):
     batch_time = AverageMeter()
@@ -76,16 +92,18 @@ def validate(net, epoch, checkpoint=None):
     net.eval()
     end = time.time()
     
-    for batch_idx, (inputs, targets) in enumerate(VAL_LOADER):
+    for batch_idx, (input_vals, targets) in enumerate(VAL_LOADER):
         with torch.no_grad():
             # measure data loading time
             data_time.update(time.time() - end)
+ 
+            loss_avg = 0
+            err1_avg = 0
+            err5_avg = 0
+            for inputs in input_vals:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
 
-            targets = targets.long()
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-
-            if args.label_type != 'full':
                 loss = criterion(outputs, targets)
 
                 # measure accuracy and record loss
@@ -93,36 +111,14 @@ def validate(net, epoch, checkpoint=None):
                 err1 = 100. - prec1
                 err5 = 100. - prec5
 
-            elif args.label_type == 'full':
-                target = {k: v.to(device) for k, v in target.items()}
-                loss_verb = criterion(outputs[0], target['verb'])
-                loss_noun = criterion(outputs[1], target['noun'])
-                loss = 0.5 * (loss_verb + loss_noun)
-                verb_losses.update(loss_verb.item(), batch_size)
-                noun_losses.update(loss_noun.item(), batch_size)
-
-                verb_output = outputs[0]
-                noun_output = outputs[1]
-
-                verb_prec1, verb_prec5 = accuracy(verb_output, target['verb'], topk=(1, 5)) 
-                verb_err1 = 100. - verb_prec1
-                verb_err5 = 100. - verb_prec5
-                verb_top1.update(verb_err1, batch_size)
-                verb_top5.update(verb_err5, batch_size)
-
-                noun_prec1, noun_prec5 = accuracy(noun_output, target['noun'], topk=(1, 5))
-                noun_err1 = 100. - noun_prec1
-                noun_err5 = 100. - noun_prec5
-                noun_top1.update(noun_err1, batch_size)
-                noun_top5.update(noun_err5, batch_size)
-
-                prec1, prec5 = multitask_accuracy((verb_output, noun_output),
-                                                  (target['verb'], target['noun']),
-                                                  topk=(1, 5))
-                err1 = 100. - prec1
-                err5 = 100. - prec5
+                loss_avg += loss.item()
+                err1_avg += err1[0]
+                err5_avg += err5[0]
 
 
+            loss_avg /= len(input_vals)
+            err1_avg /= len(input_vals)
+            err5_avg /= len(input_vals)
 
             losses.update(loss.item(), inputs.size(0))
             top1.update(err1[0], inputs.size(0))
@@ -137,33 +133,14 @@ def validate(net, epoch, checkpoint=None):
             writer.add_scalar('error/val', top1.val, epoch * len(TRAIN) + batch_idx)
         
             if batch_idx % args.print_freq == 0:
-                if args.label_type != 'full':
-                    print('Validate:[{0}/{1}]\t'
-                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                          'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                          'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                          'Error@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                          'Error@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                        batch_idx, len(VAL_LOADER), batch_time=batch_time,
-                        data_time=data_time, loss=losses, top1=top1, top5=top5))
-                elif args.label_type == 'full':
-                    print('Validate: [{0}/{1}]\t'
-                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                          'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                          'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                          'Verb Loss {verb_loss.val:.4f} ({verb_loss.avg:.4f})\t'
-                          'Noun Loss {noun_loss.val:.4f} ({noun_loss.avg:.4f})\t'
-                          'Verb Error@1 {verb_err1.val:.3f} ({verb_err1.avg:.3f})\t'
-                          'Verb Error@5 {verb_err5.val:.3f} ({verb_err5.avg:.3f})\t'
-                          'Noun Error@1 {noun_err1.val:.3f} ({noun_err1.avg:.3f})\t'
-                          'Noun Error@5 {noun_err5.val:.3f} ({noun_err5.avg:.3f})\t'
-                          'Error@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                          'Error@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                        batch_idx, len(VAL_LOADER), batch_time=batch_time,
-                        data_time=data_time, loss=losses, verb_loss = verb_losses, noun_loss = noun_losses,
-                        verb_err1 = verb_top1, verb_err5 = verb_top5, noun_err1 = noun_top1,
-                        noun_err5 = noun_top5, top1=top1, top5=top5))
-
+                print('Validate:[{0}/{1}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Error@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Error@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                    batch_idx, len(VAL_LOADER), batch_time=batch_time,
+                    data_time=data_time, loss=losses, top1=top1, top5=top5))
 
         val_losses.append(losses.avg)
         val_errors.append(top1.avg)
@@ -222,45 +199,6 @@ def accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
-def multitask_accuracy(outputs, labels, topk=(1,)):
-    """
-    Args:
-        outputs: tuple(torch.FloatTensor), each tensor should be of shape
-            [batch_size, class_count], class_count can vary on a per task basis, i.e.
-            outputs[i].shape[1] can be different to outputs[j].shape[j].
-        labels: tuple(torch.LongTensor), each tensor should be of shape [batch_size]
-        topk: tuple(int), compute accuracy at top-k for the values of k specified
-            in this parameter.
-    Returns:
-        tuple(float), same length at topk with the corresponding accuracy@k in.
-    """
-    max_k = int(np.max(topk))
-    task_count = len(outputs)
-    batch_size = labels[0].size(0)
-    all_correct = torch.zeros(max_k, batch_size).type(torch.ByteTensor)
-    if torch.cuda.is_available():
-        all_correct = all_correct.cuda()
-    for output, label in zip(outputs, labels):
-        _, max_k_idx = output.topk(max_k, dim=1, largest=True, sorted=True)
-        # Flip batch_size, class_count as .view doesn't work on non-contiguous
-        max_k_idx = max_k_idx.t()
-        correct_for_task = max_k_idx.eq(label.view(1, -1).expand_as(max_k_idx))
-        all_correct.add_(correct_for_task)
-
-    accuracies = []
-    for k in topk:
-        all_tasks_correct = torch.ge(all_correct[:k].float().sum(0), task_count)
-        accuracy_at_k = float(all_tasks_correct.float().sum(0) * 100.0 / batch_size)
-        accuracies.append(accuracy_at_k)
-    return tuple(accuracies)
-
-
-def my_collate(batch):
-    # batch contains a list of tuples of structure (sequence, target)
-    data = [item[0] for item in batch]
-    data = pack_sequence(data, enforce_sorted=False)
-    targets = [item[1] for item in batch]
-    return [data, targets]
 
 class AudioDataset(Dataset):
     def __init__(self, audio_files, file_list, window_size, step_size, n_fft, label_type = 'full',  sampling_rate = 24000, mode = 'train', im_transform = None):
@@ -297,7 +235,7 @@ class AudioDataset(Dataset):
 
     def _trim(self, record):
         data_point = np.array(self.audio_files[record.untrimmed_video_name])
-    
+        data = [] 
         start = record.start_timestamp
         end = record.stop_timestamp
         start = datetime.datetime.strptime(start, "%H:%M:%S.%f")
@@ -308,13 +246,23 @@ class AudioDataset(Dataset):
 
         end_seconds = end_timedelta.total_seconds()
         start_seconds = start_timedelta.total_seconds()
-    
+ 
         if (end_seconds - start_seconds) > 1.279:
-            start = int(round(start_seconds*self.sampling_rate))
-            end = int(round((end_seconds- 1.279)*self.sampling_rate))
-            rdm_strt = random.randint(start, end)
-            rdm_end = rdm_strt + int(np.floor((1.279*self.sampling_rate)))
-            data_point = data_point[rdm_strt:rdm_end]
+            if self.mode == 'val':                
+                num_clips = 5
+                clip_interval = int(round((((end_seconds - start_seconds) - 1.279) / num_clips) * self.sampling_rate))
+                start = int(round(start_seconds * self.sampling_rate))
+                for clip in range(num_clips):            
+                    val_clip = data_point[start:(start+int(round((1.279 * self.sampling_rate))))]
+                    data.append(val_clip)
+                    start += clip_interval                              
+           
+            else:
+                start = int(round(start_seconds*self.sampling_rate))
+                end = int(round((end_seconds- 1.279)*self.sampling_rate))
+                rdm_strt = random.randint(start, end)
+                rdm_end = rdm_strt + int(np.floor((1.279*self.sampling_rate)))
+                data.append(data_point[rdm_strt:rdm_end])
         else:
             mid_seconds = (start_seconds + end_seconds)/2
         
@@ -327,13 +275,12 @@ class AudioDataset(Dataset):
             duration = data_point.shape[0] / float(self.sampling_rate)
         
             if left_seconds < 0:
-                data_point = data_point[:int(round(self.sampling_rate * 1.279))]
+                data.append(data_point[:int(round(self.sampling_rate * 1.279))])
             elif right_seconds > duration:
-                data_point = data_point[-int(round(self.sampling_rate * 1.279)):]
+                data.append(data_point[-int(round(self.sampling_rate * 1.279)):])
             else:
-                data_point = data_point[left_sample:right_sample]
-
-        return data_point
+                data.append(data_point[left_sample:right_sample])
+        return data
 
     def __getitem__(self, index):
         if self.audio_files is None:
@@ -341,24 +288,25 @@ class AudioDataset(Dataset):
         #get record
         record = self.audio_list[index]
         #trim to right action length
-        data_point = self._trim(record)
-          
-        # getting spec
-        spec = self._make_spec(data_point)
+        data = self._trim(record)
         
-        # convert to tensor
-        spec = self.im_transform(spec) 
+        specs = [] 
+        for item in data: 
+            # getting spec
+            spec = self._make_spec(item)
         
-        #augment
-        if args.augment and self.mode == 'train':
-            spec = spec_augment_pytorch.spec_augment(spec, 
-                        time_warping_para = args.time_warp, frequency_masking_para = args.freq_mask, 
-                        time_masking_para = args.time_mask)
-       
-        if self.label_type == 'full':
-            return spec, record.label
- 
-        return spec, record.label[self.label_type]
+            # convert to tensor
+            spec = self.im_transform(spec) 
+        
+            #augment
+            if args.augment and self.mode == 'train':
+                spec = spec_augment_pytorch.spec_augment(spec, 
+                            time_warping_para = args.time_warp, frequency_masking_para = args.freq_mask, 
+                            time_masking_para = args.time_mask, frequency_mask_num = args.mask_num, time_mask_num = args.mask_num)
+            specs.append(spec)
+        if self.mode == 'val':
+            print(len(specs)) 
+        return specs, record.label[self.label_type]
 
 
     
@@ -392,7 +340,7 @@ TRAIN_LOADER = DataLoader(dataset=TRAIN,
                           batch_size=args.batch_size, 
                           shuffle=True, 
                           drop_last = True, 
-                          num_workers=16,
+                          num_workers=28,
                           pin_memory=True)
 
 VAL = AudioDataset(args.data_path, 
@@ -409,7 +357,7 @@ VAL_LOADER = DataLoader(dataset=VAL,
                         batch_size=args.batch_size, 
                         shuffle = False, 
                         drop_last = True, 
-                        num_workers=16,
+                        num_workers=28,
                         pin_memory=True)
 
 model = models.resnet50(pretrained=args.pretrained)
@@ -440,7 +388,13 @@ if torch.cuda.device_count() > 1:
 model.to(device)
 model.train()
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
+if args.ops == 'SGD':
+    optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
+    scheduler = MultiStepLR(optimizer, milestones=[20,40], gamma=0.1)
+elif args.ops == 'Adam':
+    optimizer = optim.Adam(model.parameters())
+elif args.ops == 'AdamW':
+    optimizer = optim.AdamW(model.parameters())
 
 val_losses = []
 train_losses = []
@@ -452,14 +406,6 @@ data_time = AverageMeter()
 losses = AverageMeter()
 top1 = AverageMeter()
 top5 = AverageMeter()
-if args.label_type == 'full':
-    verb_losses = AverageMeter()
-    noun_losses = AverageMeter()
-    verb_top1 = AverageMeter()
-    verb_top5 = AverageMeter()
-    noun_top1 = AverageMeter()
-    noun_top5 = AverageMeter()
-
 end = time.time()
 
 for epoch in range(args.epochs):  # loop over the dataset multiple times
@@ -469,49 +415,17 @@ for epoch in range(args.epochs):  # loop over the dataset multiple times
          # measure data loading time
         data_time.update(time.time() - end)
            
-        #targets = targets.long()
+        inputs = inputs[0]
         inputs = inputs.to(device)
         outputs = model(inputs)
 
-        if args.label_type != 'full':
-            targets = targets.to(device)
-            loss = criterion(outputs, targets)
+        targets = targets.to(device)
+        loss = criterion(outputs, targets)
 
-            # measure accuracy and record loss
-            prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-            err1 = 100. - prec1
-            err5 = 100. - prec5
-
-        elif args.label_type == 'full':
-            targets = {k: v.to(device) for k, v in targets.items()}
-            loss_verb = criterion(outputs[0], targets['verb'])
-            loss_noun = criterion(outputs[1], targets['noun'])
-            loss = 0.5 * (loss_verb + loss_noun)
-            verb_losses.update(loss_verb.item(), batch_size)
-            noun_losses.update(loss_noun.item(), batch_size)
-
-            verb_output = outputs[0]
-            noun_output = outputs[1]
-
-            verb_prec1, verb_prec5 = accuracy(verb_output, targets['verb'], topk=(1, 5)) 
-            verb_err1 = 100. - verb_prec1
-            verb_err5 = 100. - verb_prec5
-            verb_top1.update(verb_err1, batch_size)
-            verb_top5.update(verb_err5, batch_size)
-
-            noun_prec1, noun_prec5 = accuracy(noun_output, targets['noun'], topk=(1, 5))
-            noun_err1 = 100. - noun_prec1
-            noun_err5 = 100. - noun_prec5
-            noun_top1.update(noun_err1, batch_size)
-            noun_top5.update(noun_err5, batch_size)
-
-            prec1, prec5 = multitask_accuracy((verb_output, noun_output),
-                                              (targets['verb'], targets['noun']),
-                                              topk=(1, 5))
-            err1 = 100. - prec1
-            err5 = 100. - prec5
-
-
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
+        err1 = 100. - prec1
+        err5 = 100. - prec5
 
         losses.update(loss.item(), inputs.size(0))
         top1.update(err1[0], inputs.size(0))
@@ -530,32 +444,14 @@ for epoch in range(args.epochs):  # loop over the dataset multiple times
         writer.add_scalar('error/train', top1.val, epoch * len(TRAIN) + batch_idx)
                           
         if batch_idx % args.print_freq == 0:
-            if args.label_type != 'full':
-                print('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Error@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                      'Error@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                    epoch, batch_idx, len(TRAIN_LOADER), batch_time=batch_time,
-                    data_time=data_time, loss=losses, top1=top1, top5=top5))
-            elif args.label_type == 'full':
-                print('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Verb Loss {verb_loss.val:.4f} ({verb_loss.avg:.4f})\t'
-                      'Noun Loss {noun_loss.val:.4f} ({noun_loss.avg:.4f})\t'
-                      'Verb Error@1 {verb_err1.val:.3f} ({verb_err1.avg:.3f})\t'
-                      'Verb Error@5 {verb_err5.val:.3f} ({verb_err5.avg:.3f})\t'
-                      'Noun Error@1 {noun_err1.val:.3f} ({noun_err1.avg:.3f})\t'
-                      'Noun Error@5 {noun_err5.val:.3f} ({noun_err5.avg:.3f})\t'
-                      'Error@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                      'Error@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                    epoch, batch_idx, len(TRAIN_LOADER), batch_time=batch_time,
-                    data_time=data_time, loss=losses, verb_loss = verb_losses, noun_loss = noun_losses,
-                    verb_err1 = verb_top1, verb_err5 = verb_top5, noun_err1 = noun_top1,
-                    noun_err5 = noun_top5, top1=top1, top5=top5))
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Error@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Error@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                epoch, batch_idx, len(TRAIN_LOADER), batch_time=batch_time,
+                data_time=data_time, loss=losses, top1=top1, top5=top5))
 
 
     train_losses.append(losses.avg)
@@ -563,6 +459,9 @@ for epoch in range(args.epochs):  # loop over the dataset multiple times
     if epoch % args.eval_freq == 0:
         validate(model, epoch) 
         model.train()
+    
+    if args.scheduler:
+        scheduler.step()
 writer.close()
 print('Finished Training')
 
