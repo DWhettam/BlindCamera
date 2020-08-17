@@ -27,8 +27,10 @@ import PIL
 import random
 import os
 from torchvision import transforms
+from utils.plotcm import plot_confusion_matrix
 from torch.nn.utils.rnn import pack_sequence
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import *
+from sklearn.metrics import confusion_matrix
 import argparse
 
 parser = argparse.ArgumentParser(description='BlindCamera_args')
@@ -48,13 +50,14 @@ parser.add_argument('--hop_length', default=5, type=float, help='STFT hop length
 parser.add_argument('--sampling_rate', default=24000, type=float, help='audio sampling length')
 parser.add_argument('--pretrained', default=True, type=bool, help='Imagenet pretraining')
 parser.add_argument('--augment', default=True, type=bool, help='Audio data augmentations')
-parser.add_argument('--scheduler', default=False, type=bool, help='Audio data augmentations')
+parser.add_argument('--scheduler', default=None, type=str, choices = ['MultiStep', 'Plateau'], help='Audio data augmentations')
 parser.add_argument('--time_warp', default=20, type=int, help='Time warping parameter')
 parser.add_argument('--freq_mask', default=30, type=int, help='Frequency masking parameter')
 parser.add_argument('--time_mask', default=30, type=int, help='Time masking parameter')
 parser.add_argument('--mask_size', default=10, type=int, help='Size of mask for frequency and time masking')
 parser.add_argument('--mask_num', default=1, type=int, help='Number of time and frequency masks')
 parser.add_argument('--num_mels', default=128, type=int, help='Number of mel frequency bins')
+parser.add_argument('--Dropout', default=0.5, type=float, help='Dropout value')
 parser.add_argument('--label_type', default='verb', type=str, choices=['verb', 'noun'], help='Label type: verb, noun')
 parser.add_argument('--ops', default='SGD', type=str, choices=['SGD','Adam','AdamW'], help='Which optimiser to be used')
 
@@ -69,7 +72,15 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 train_csv = args.annotation_path + 'EPIC_100_train.pkl'
 #test_csv = args.data_path + 'evaluation_setup/fold1_itest.csv'
 evaluate_csv = args.annotation_path + 'EPIC_100_validation.pkl'
+verb_classes = pd.read_csv(args.annotation_path + 'EPIC_100_verb_classes.csv')
+noun_classes = pd.read_csv(args.annotation_path + 'EPIC_100_noun_classes.csv')
+verb_classes = verb_classes.drop('instances', 1)
+noun_classes = noun_classes.drop('instances', 1)
 
+if args.label_type == 'verb':
+    num_classes = len(verb_classes.index)
+else:
+    num_classes = len(noun_classes.index)
 
 previous_runs = os.listdir('runs/EPIC_baselines')
 if len(previous_runs) == 0:
@@ -92,37 +103,31 @@ def validate(net, epoch, checkpoint=None):
     net.eval()
     end = time.time()
     
-    for batch_idx, (input_vals, targets) in enumerate(VAL_LOADER):
+    for batch_idx, (inputs, targets) in enumerate(VAL_LOADER):
         with torch.no_grad():
             # measure data loading time
             data_time.update(time.time() - end)
- 
-            loss_avg = 0
-            err1_avg = 0
-            err5_avg = 0
-            for inputs in input_vals:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
+            
+            inputs, targets = inputs.to(device), targets.to(device)
 
-                loss = criterion(outputs, targets)
+            inputs = inputs.contiguous().view(-1, 1, np.shape(inputs)[2], np.shape(inputs)[3])            
+            
+            outputs = model(inputs)
+            
+            outputs = outputs.reshape(args.batch_size, 5, num_classes)
+            outputs = torch.mean(outputs, 1)
+            
+            loss = criterion(outputs, targets)
+            
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
+            err1 = 100. - prec1
+            err5 = 100. - prec5
 
-                # measure accuracy and record loss
-                prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-                err1 = 100. - prec1
-                err5 = 100. - prec5
-
-                loss_avg += loss.item()
-                err1_avg += err1[0]
-                err5_avg += err5[0]
-
-
-            loss_avg /= len(input_vals)
-            err1_avg /= len(input_vals)
-            err5_avg /= len(input_vals)
-
+                
             losses.update(loss.item(), inputs.size(0))
-            top1.update(err1[0], inputs.size(0))
-            top5.update(err5[0], inputs.size(0))
+            top1.update(err1.item(), inputs.size(0))
+            top5.update(err5.item(), inputs.size(0))
 
 
             # measure elapsed time
@@ -164,6 +169,8 @@ def validate(net, epoch, checkpoint=None):
         }
         print('SAVED!')
         torch.save(state, 'checkpoints/%s.t7' % checkpoint)
+
+    return losses.avg
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -255,8 +262,7 @@ class AudioDataset(Dataset):
                 for clip in range(num_clips):            
                     val_clip = data_point[start:(start+int(round((1.279 * self.sampling_rate))))]
                     data.append(val_clip)
-                    start += clip_interval                              
-           
+                    start += clip_interval           
             else:
                 start = int(round(start_seconds*self.sampling_rate))
                 end = int(round((end_seconds- 1.279)*self.sampling_rate))
@@ -303,9 +309,15 @@ class AudioDataset(Dataset):
                 spec = spec_augment_pytorch.spec_augment(spec, 
                             time_warping_para = args.time_warp, frequency_masking_para = args.freq_mask, 
                             time_masking_para = args.time_mask, frequency_mask_num = args.mask_num, time_mask_num = args.mask_num)
+            
+            spec = torch.squeeze(spec)
             specs.append(spec)
-        if self.mode == 'val':
-            print(len(specs)) 
+       
+        specs = torch.stack(specs)
+        
+        if self.mode == 'val' and np.shape(specs)[0] == 1:
+            specs = specs.repeat(5, 1, 1)  
+           
         return specs, record.label[self.label_type]
 
 
@@ -343,6 +355,7 @@ TRAIN_LOADER = DataLoader(dataset=TRAIN,
                           num_workers=28,
                           pin_memory=True)
 
+
 VAL = AudioDataset(args.data_path, 
                    evaluate_csv, 
                    sampling_rate = args.sampling_rate, 
@@ -369,16 +382,9 @@ if args.pretrained:
 
 num_ftrs = model.fc.in_features
 
-if args.label_type == 'verb':
-    model.fc = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(num_ftrs, 97)
-    )
-elif args.label_type == 'noun':
-    model.fc = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(num_ftrs, 300)
-    )
+model.fc = nn.Sequential(
+    nn.Dropout(args.Dropout),
+    nn.Linear(num_ftrs, num_classes))
 
 if torch.cuda.device_count() > 1:
     print("Let's use", torch.cuda.device_count(), "GPUs!")
@@ -390,16 +396,24 @@ model.train()
 criterion = nn.CrossEntropyLoss()
 if args.ops == 'SGD':
     optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
-    scheduler = MultiStepLR(optimizer, milestones=[20,40], gamma=0.1)
+    if args.scheduler == 'MultiStep':
+        scheduler = MultiStepLR(optimizer, milestones=[20,40], gamma=0.1)
+    elif args.scheduler == 'Plateau':
+        scheduler = ReduceLROnPlateau(optimizer, 'min')
 elif args.ops == 'Adam':
     optimizer = optim.Adam(model.parameters())
 elif args.ops == 'AdamW':
     optimizer = optim.AdamW(model.parameters())
 
+
+
 val_losses = []
 train_losses = []
 val_errors = []
 train_errors = []
+
+conf_mats = []
+class_accuracies = []
 
 batch_time = AverageMeter()
 data_time = AverageMeter()
@@ -408,14 +422,18 @@ top1 = AverageMeter()
 top5 = AverageMeter()
 end = time.time()
 
+
 for epoch in range(args.epochs):  # loop over the dataset multiple times
+
+    # Initialize the prediction and label lists(tensors)
+    #predlist=torch.zeros(0,dtype=torch.long, device='cpu')
+    #lbllist=torch.zeros(0,dtype=torch.long, device='cpu')
 
     running_loss = 0.0
     for batch_idx, (inputs, targets) in enumerate(TRAIN_LOADER):
          # measure data loading time
         data_time.update(time.time() - end)
            
-        inputs = inputs[0]
         inputs = inputs.to(device)
         outputs = model(inputs)
 
@@ -453,15 +471,49 @@ for epoch in range(args.epochs):  # loop over the dataset multiple times
                 epoch, batch_idx, len(TRAIN_LOADER), batch_time=batch_time,
                 data_time=data_time, loss=losses, top1=top1, top5=top5))
 
+       
 
+
+        ##-------Confusion Matrix Creation-------------
+
+       # _, preds = torch.max(outputs, 1)
+
+        # Append batch prediction results
+        #predlist=torch.cat([predlist,preds.view(-1).cpu()])
+        #lbllist=torch.cat([lbllist,targets.view(-1).cpu()])
+       
+
+    #if args.label_type == 'verb':    
+     #   label_list = verb_classes.values.tolist()
+    #else:
+     #   label_list = noun_classes.values.tolist()
+
+    ## Confusion matrix
+    #conf_mat=confusion_matrix(lbllist.numpy(), predlist.numpy())
+    #conf_mats.append(conf_mat)
+    ## Per-class accuracy
+    #class_accuracy=100*conf_mat.diagonal()/conf_mat.sum(1)
+    #class_accuracies.append(class_accuracy)
+       
+    #plot_buf = plot_confusion_matrix(conf_mat, label_list)
+    #image = PIL.Image.open(plot_buf)
+    #image = transforms.ToTensor()(image).unsqueeze(0)
+    #grid = torchvision.utils.make_grid(image)
+    #writer.add_image('Training confusion matrix', grid, 0)
+#    writer.image("Training Confusion Matrix", image, step = epoch)
+  
     train_losses.append(losses.avg)
     train_errors.append(top1.avg)
     if epoch % args.eval_freq == 0:
-        validate(model, epoch) 
+        val_loss = validate(model, epoch) 
         model.train()
     
-    if args.scheduler:
+    if args.scheduler == 'MultiStep':
         scheduler.step()
+    elif args.scheduler == 'Plateau':
+        scheduler.step(val_loss)
 writer.close()
+#print(conf_mats[-1])
+#print(class_accuracies[-1])
 print('Finished Training')
 
