@@ -6,6 +6,10 @@ from torch.utils.data import DataLoader
 from utils.datasets import AudioDataset
 from utils.utils import *
 import json
+import itertools
+import numpy as np
+import pandas as pd
+from collections import Counter
 
 with open('runs/EPIC_baselines/run_16/args.txt') as json_file:
     model_args = json.load(json_file)
@@ -27,6 +31,28 @@ verb_classes = pd.read_csv(args.annotation_path + 'EPIC_100_verb_classes.csv')
 noun_classes = pd.read_csv(args.annotation_path + 'EPIC_100_noun_classes.csv')
 verb_classes = verb_classes.drop('instances', 1)
 noun_classes = noun_classes.drop('instances', 1)
+
+def create_csv(lbllist, predlist, label_list):
+    lbllist = lbllist.numpy()
+    predlist = predlist.numpy()
+    
+    c = Counter(lbllist)
+    top20_classes = c.most_common(20)
+    top20_classes = [i[0] for i in top20_classes]
+    
+    del_idx = [] 
+    for idx, (lbl_item, pred_item) in enumerate(zip(lbllist, predlist)):
+        if lbl_item not in top20_classes or pred_item not in top20_classes:
+            del_idx.append(idx)
+
+    for idx in sorted(del_idx, reverse=True):
+        lbllist = np.delete(lbllist, idx)
+        predlist = np.delete(predlist, idx)
+        
+    df = pd.DataFrame(lbllist, columns = ['labels'])
+    df['predictions'] = predlist
+    csv_path = 'runs/EPIC_baselines/run_' + str(args.run_num) + '/preds_labels.csv'
+    df.to_csv('csv_path.csv', sep=',', encoding='utf-8')
 
 def validate(net):
     batch_time = AverageMeter()
@@ -125,4 +151,4 @@ if model_args['label_type'] == 'verb':
 else:
     label_list = noun_classes.values.tolist()
 
-image = create_confusion_matrix(lbllist, predlist, label_list) 
+image = create_csv(lbllist, predlist, label_list) 
