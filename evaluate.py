@@ -5,11 +5,17 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader
 from utils.datasets import AudioDataset
 from utils.utils import *
+import torchvision
+from torchvision import transforms
+from torchvision import models
 import json
 import itertools
 import numpy as np
 import pandas as pd
+import time
 from collections import Counter
+import os
+import pickle
 
 with open('runs/EPIC_baselines/run_16/args.txt') as json_file:
     model_args = json.load(json_file)
@@ -19,11 +25,18 @@ parser.add_argument('--annotation_path', default='/mnt/storage/home/qc19291/scra
                     help='folder containing EPIC annotations')
 parser.add_argument('--data_path', default='/mnt/storage/home/qc19291/scratch/EPIC/EPIC_audio.hdf5', type=str,
                     help='folder containing EPIC data')
-parser.add_argument('--run_num', type=int, help='Which run to evaluate')
-parser.add_argument('--gpus', default=2, type=int, help='number of gpus')
+parser.add_argument('--run', type=int, help='Which run to evaluate')
+parser.add_argument('--ngpus', default=2, type=int, help='number of gpus')
 
 args = parser.parse_args()
 print(args)
+
+os.environ["CUDA_VISIBLE_DEVICES"] = ", ".join(map(str, list(range(0, args.ngpus))))
+torch.cuda.empty_cache()
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+
 
 train_csv = args.annotation_path + 'EPIC_100_train.pkl'
 evaluate_csv = args.annotation_path + 'EPIC_100_validation.pkl'
@@ -32,37 +45,50 @@ noun_classes = pd.read_csv(args.annotation_path + 'EPIC_100_noun_classes.csv')
 verb_classes = verb_classes.drop('instances', 1)
 noun_classes = noun_classes.drop('instances', 1)
 
-def create_csv(lbllist, predlist, label_list):
-    lbllist = lbllist.numpy()
-    predlist = predlist.numpy()
-    
-    c = Counter(lbllist)
-    top20_classes = c.most_common(20)
-    top20_classes = [i[0] for i in top20_classes]
-    
-    del_idx = [] 
-    for idx, (lbl_item, pred_item) in enumerate(zip(lbllist, predlist)):
-        if lbl_item not in top20_classes or pred_item not in top20_classes:
-            del_idx.append(idx)
 
-    for idx in sorted(del_idx, reverse=True):
-        lbllist = np.delete(lbllist, idx)
-        predlist = np.delete(predlist, idx)
+if model_args['label_type'] == 'verb':
+    num_classes = len(verb_classes.index)
+else:
+    num_classes = len(noun_classes.index)
+
+def create_csv(lbllist, predlist, label_list):
+    new_dim = int(np.shape(predlist)[0]) * int(np.shape(predlist)[1])
+    predlist = predlist.view(new_dim, np.shape(predlist)[2])
+    
+    scores = {'scores':predlist,
+            'labels':lbllist} 
+    
+    with open('scores.pkl', 'wb') as handle:
+        pickle.dump(scores, handle)
+    #c = Counter(lbllist)
+    #top20_classes = c.most_common(20)
+    #top20_classes = [i[0] for i in top20_classes]
+    
+    #del_idx = [] 
+    #for idx, (lbl_item, pred_item) in enumerate(zip(lbllist, predlist)):
+    #    if lbl_item not in top20_classes or pred_item not in top20_classes:
+    #        del_idx.append(idx)
+
+    #for idx in sorted(del_idx, reverse=True):
+    #    lbllist = np.delete(lbllist, idx)
+    #    predlist = np.delete(predlist, idx)
         
-    df = pd.DataFrame(lbllist, columns = ['labels'])
-    df['predictions'] = predlist
-    csv_path = 'runs/EPIC_baselines/run_' + str(args.run_num) + '/preds_labels.csv'
-    df.to_csv('csv_path.csv', sep=',', encoding='utf-8')
+   # df_preds = pd.DataFrame(lbllist, columns = ['labels'])
+    #df_labels = pd.DataFrame(predlist, columns = ['predictions'])
+    #csv_path = 'runs/EPIC_baselines/run_' + str(args.run)
+    #df_preds.to_csv(csv_path + '/preds.csv', sep=',', encoding='utf-8')
+    #df_labels.to_csv(csv_path + '/labels.csv', sep=',', encoding='utf-8')
 
 def validate(net):
+    data_time = AverageMeter()
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
     
     # Initialize the prediction and label lists(tensors)
-    predlist=torch.zeros(0,dtype=torch.long, device='cpu')
-    lbllist=torch.zeros(0,dtype=torch.long, device='cpu')
+    predlist=torch.zeros(0,dtype=torch.float).to(device)
+    lbllist=torch.zeros(0,dtype=torch.long).to(device)
 
     net.eval()
     end = time.time()
@@ -77,16 +103,10 @@ def validate(net):
             inputs = inputs.contiguous().view(-1, 1, np.shape(inputs)[2], np.shape(inputs)[3])            
             
             outputs = model(inputs)
-            
+        
             outputs = outputs.reshape(int(model_args['batch_size']), 5, num_classes)
             outputs = torch.mean(outputs, 1)
-            
-            _, preds = torch.max(outputs, 1)
-
-            #Append batch prediction results
-            predlist=torch.cat([predlist,preds.view(-1).cpu()])
-            lbllist=torch.cat([lbllist,targets.view(-1).cpu()])
-
+             
             loss = criterion(outputs, targets)
             
             # measure accuracy and record loss
@@ -99,6 +119,10 @@ def validate(net):
             top1.update(err1.item(), inputs.size(0))
             top5.update(err5.item(), inputs.size(0))
 
+            #Append batch prediction results
+            outputs = outputs.unsqueeze(0)
+            predlist=torch.cat([predlist,outputs], 0)
+            lbllist=torch.cat([lbllist,targets], 0)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -108,21 +132,30 @@ def validate(net):
           .format(top1=top1, top5=top5))
     print(out)
 
-    return losses.avg
+    return losses.avg, predlist, lbllist
 
+
+image_transform = torchvision.transforms.Compose([
+    transforms.ToTensor(),
+])
 
 VAL = AudioDataset(args.data_path, 
                    evaluate_csv, 
-                   sampling_rate = args.sampling_rate, 
-                   window_size = args.window_size, 
-                   step_size = args.hop_length, 
+                   sampling_rate = model_args['sampling_rate'], 
+                   window_size = model_args['window_size'], 
+                   step_size = model_args['hop_length'], 
                    n_fft = 512,
-                   label_type = args.label_type,
+                   time_warp = model_args['time_warp'],
+                   freq_mask = model_args['freq_mask'],
+                   time_mask = model_args['time_mask'],
+                   mask_size = model_args['mask_size'],
+                   mask_num = model_args['mask_num'],
+                   label_type = model_args['label_type'],
                    mode = 'val',
                    im_transform=image_transform)
 
 VAL_LOADER = DataLoader(dataset=VAL, 
-                        batch_size=64, 
+                        batch_size=model_args['batch_size'], 
                         shuffle = False, 
                         drop_last = True, 
                         num_workers=28,
@@ -138,17 +171,19 @@ num_ftrs = model.fc.in_features
 model.fc = torch.nn.Sequential(
     torch.nn.Dropout(0.5),
     torch.nn.Linear(num_ftrs, 97))
-model = torch.nn.DataParallel(model, device_ids = range(0, args.gpus))
+model = torch.nn.DataParallel(model, device_ids = range(0, args.ngpus))
 
-model_path = 'runs/EPIC_baselines/run_' + str(args.run_num) + '/model.t7'
-checkpoint = torch.load('model_path')
+model_path = 'runs/EPIC_baselines/run_' + str(args.run) + '/model.t7'
+checkpoint = torch.load(model_path)
 model.load_state_dict(checkpoint['state'])
 
-validate(model)
+criterion = torch.nn.CrossEntropyLoss()
+
+_, predlist, lbllist = validate(model)
 
 if model_args['label_type'] == 'verb':    
     label_list = verb_classes.values.tolist() 
 else:
     label_list = noun_classes.values.tolist()
 
-image = create_csv(lbllist, predlist, label_list) 
+_  = create_csv(lbllist, predlist, label_list) 
