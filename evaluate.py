@@ -16,20 +16,22 @@ import time
 from collections import Counter
 import os
 import pickle
-
-with open('runs/EPIC_baselines/run_16/args.txt') as json_file:
-    model_args = json.load(json_file)
+import copy
 
 parser = argparse.ArgumentParser(description='BlindCamera_args')
 parser.add_argument('--annotation_path', default='/mnt/storage/home/qc19291/scratch/EPIC/epic-kitchens-100-annotations/', type=str,
                     help='folder containing EPIC annotations')
 parser.add_argument('--data_path', default='/mnt/storage/home/qc19291/scratch/EPIC/EPIC_audio.hdf5', type=str,
                     help='folder containing EPIC data')
-parser.add_argument('--run', type=int, help='Which run to evaluate')
-parser.add_argument('--ngpus', default=2, type=int, help='number of gpus')
+parser.add_argument('--noun_run', type=str, default = None,  help='noun run to evaluate')
+parser.add_argument('--verb_run', type=str, default = None, help='verb run to evaluate')
+parser.add_argument('--ngpus', default=1, type=int, help='number of gpus')
 
 args = parser.parse_args()
 print(args)
+
+with open('runs/EPIC_baselines/run_18/args.txt') as json_file:
+    model_args = json.load(json_file)
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ", ".join(map(str, list(range(0, args.ngpus))))
 torch.cuda.empty_cache()
@@ -46,20 +48,41 @@ verb_classes = verb_classes.drop('instances', 1)
 noun_classes = noun_classes.drop('instances', 1)
 
 
-if model_args['label_type'] == 'verb':
-    num_classes = len(verb_classes.index)
-else:
-    num_classes = len(noun_classes.index)
+num_verb_classes = len(verb_classes.index)
+num_noun_classes = len(noun_classes.index)
 
-def create_csv(lbllist, predlist, label_list):
-    new_dim = int(np.shape(predlist)[0]) * int(np.shape(predlist)[1])
-    predlist = predlist.view(new_dim, np.shape(predlist)[2])
+def create_csv(verb_lbllist = None, verb_predlist=None, verb_outlist=None, verb_run=None, noun_lbllist = None, noun_predlist = None, noun_outlist=None, noun_run = None):
     
-    scores = {'scores':predlist,
-            'labels':lbllist} 
-    
-    with open('scores.pkl', 'wb') as handle:
-        pickle.dump(scores, handle)
+    if verb_run is not None:
+        new_dim = int(np.shape(verb_outlist)[0]) * int(np.shape(verb_outlist)[1])
+        verb_outlist = verb_outlist.view(new_dim, np.shape(verb_outlist)[2]).cpu()
+        verb_lbllist = verb_lbllist.cpu()
+
+
+        df_preds = pd.DataFrame(verb_predlist, columns = ['predictions'])
+        df_labels = pd.DataFrame(verb_lbllist, columns = ['labels'])
+        csv_path = 'runs/EPIC_baselines/run_' + str(verb_run)
+        df_preds.to_csv(csv_path + '/preds.csv', sep=',', encoding='utf-8')
+        df_labels.to_csv(csv_path + '/labels.csv', sep=',', encoding='utf-8')
+
+
+    if noun_run is not None:
+        new_dim = int(np.shape(noun_outlist)[0]) * int(np.shape(noun_outlist)[1])
+        noun_outlist = noun_outlist.view(new_dim, np.shape(noun_outlist)[2]).cpu()
+        noun_lbllist = noun_lbllist.cpu()
+   
+        df_labels = pd.DataFrame(noun_lbllist, columns = ['labels'])
+        df_preds = pd.DataFrame(noun_predlist, columns = ['predictions'])
+        csv_path = 'runs/EPIC_baselines/run_' + str(noun_run)
+        df_preds.to_csv(csv_path + '/preds.csv', sep=',', encoding='utf-8')
+        df_labels.to_csv(csv_path + '/labels.csv', sep=',', encoding='utf-8')
+
+    if verb_run is not None and noun_run is not None:
+        verb_outlist = verb_outlist.numpy()
+        noun_outlist = noun_outlist.numpy()
+        scores = {'scores':{'verb':verb_outlist,'noun':noun_outlist}}   
+        with open('scores.pkl', 'wb') as handle:
+            pickle.dump(scores, handle)
     #c = Counter(lbllist)
     #top20_classes = c.most_common(20)
     #top20_classes = [i[0] for i in top20_classes]
@@ -73,13 +96,8 @@ def create_csv(lbllist, predlist, label_list):
     #    lbllist = np.delete(lbllist, idx)
     #    predlist = np.delete(predlist, idx)
         
-   # df_preds = pd.DataFrame(lbllist, columns = ['labels'])
-    #df_labels = pd.DataFrame(predlist, columns = ['predictions'])
-    #csv_path = 'runs/EPIC_baselines/run_' + str(args.run)
-    #df_preds.to_csv(csv_path + '/preds.csv', sep=',', encoding='utf-8')
-    #df_labels.to_csv(csv_path + '/labels.csv', sep=',', encoding='utf-8')
 
-def validate(net):
+def validate(net, num_classes):
     data_time = AverageMeter()
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -87,8 +105,9 @@ def validate(net):
     top5 = AverageMeter()
     
     # Initialize the prediction and label lists(tensors)
-    predlist=torch.zeros(0,dtype=torch.float).to(device)
+    predlist=torch.zeros(0,dtype=torch.long).to(device)
     lbllist=torch.zeros(0,dtype=torch.long).to(device)
+    outlist = torch.zeros(0, dtype = torch.float).to(device)
 
     net.eval()
     end = time.time()
@@ -102,11 +121,11 @@ def validate(net):
 
             inputs = inputs.contiguous().view(-1, 1, np.shape(inputs)[2], np.shape(inputs)[3])            
             
-            outputs = model(inputs)
+            outputs = net(inputs)
         
             outputs = outputs.reshape(int(model_args['batch_size']), 5, num_classes)
             outputs = torch.mean(outputs, 1)
-             
+            _, preds = torch.max(outputs, 1) 
             loss = criterion(outputs, targets)
             
             # measure accuracy and record loss
@@ -121,8 +140,9 @@ def validate(net):
 
             #Append batch prediction results
             outputs = outputs.unsqueeze(0)
-            predlist=torch.cat([predlist,outputs], 0)
-            lbllist=torch.cat([lbllist,targets], 0)
+            outlist=torch.cat([outlist,outputs], 0)
+            predlist = torch.cat([predlist, preds.view(-1)], 0)
+            lbllist=torch.cat([lbllist,targets.view(-1)], 0)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -132,7 +152,7 @@ def validate(net):
           .format(top1=top1, top5=top5))
     print(out)
 
-    return losses.avg, predlist, lbllist
+    return losses.avg, predlist, lbllist, outlist
 
 
 image_transform = torchvision.transforms.Compose([
@@ -161,29 +181,49 @@ VAL_LOADER = DataLoader(dataset=VAL,
                         num_workers=28,
                         pin_memory=True)
 
-model = models.resnet50()
+verb_model = models.resnet50()
 with torch.no_grad():
-    weights = torch.nn.Parameter(torch.mean(model._modules['conv1'].weight, 1, True))
-    model.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    model.conv1.weight = weights
+    weights = torch.nn.Parameter(torch.mean(verb_model._modules['conv1'].weight, 1, True))
+    verb_model.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    verb_model.conv1.weight = weights
 
-num_ftrs = model.fc.in_features
-model.fc = torch.nn.Sequential(
+
+noun_model = copy.deepcopy(verb_model)
+
+num_ftrs = verb_model.fc.in_features
+verb_model.fc = torch.nn.Sequential(
     torch.nn.Dropout(0.5),
-    torch.nn.Linear(num_ftrs, 97))
-model = torch.nn.DataParallel(model, device_ids = range(0, args.ngpus))
+    torch.nn.Linear(num_ftrs, num_verb_classes))
+verb_model = torch.nn.DataParallel(verb_model, device_ids = range(0, args.ngpus))
 
-model_path = 'runs/EPIC_baselines/run_' + str(args.run) + '/model.t7'
-checkpoint = torch.load(model_path)
-model.load_state_dict(checkpoint['state'])
+num_ftrs = noun_model.fc.in_features
+noun_model.fc = torch.nn.Sequential(
+    torch.nn.Dropout(0.5),
+    torch.nn.Linear(num_ftrs, num_noun_classes))
+noun_model = noun_model.to(device)
+#noun_model = torch.nn.DataParallel(noun_model, device_ids = range(0, args.ngpus))
 
 criterion = torch.nn.CrossEntropyLoss()
 
-_, predlist, lbllist = validate(model)
+verb_predlist = None
+noun_predlist = None
+verb_lbllist = None
+noun_llbllist = None
+verb_outlist = None
+noun_outlist = None
 
-if model_args['label_type'] == 'verb':    
-    label_list = verb_classes.values.tolist() 
-else:
-    label_list = noun_classes.values.tolist()
+if args.verb_run is not None:
+    verb_model_path = 'runs/EPIC_baselines/run_' + str(args.verb_run) + '/model.t7'
+    verb_checkpoint = torch.load(verb_model_path)
+    verb_model.load_state_dict(verb_checkpoint['state'])
+    _, verb_predlist, verb_lbllist, verb_outlist = validate(verb_model, num_verb_classes)
+if args.noun_run is not None:
+    noun_model_path = 'runs/EPIC_baselines/run_' + str(args.noun_run) + '/model.t7'
+    noun_checkpoint = torch.load(noun_model_path)
+    noun_model.load_state_dict(noun_checkpoint['state'])
+    _, noun_predlist, noun_lbllist, noun_outlist = validate(noun_model, num_noun_classes)
 
-_  = create_csv(lbllist, predlist, label_list) 
+
+
+_  = create_csv(verb_lbllist, verb_predlist, verb_outlist, args.verb_run, noun_predlist, noun_lbllist, noun_outlist, args.noun_run) 
+
