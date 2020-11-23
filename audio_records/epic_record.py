@@ -25,7 +25,7 @@ class EpicAudioRecord(AudioRecord):
     @property
     def narration(self):
         return self._series['narration']
-    
+
     @property
     def label(self):
         if 'verb_class' in self._series.keys().tolist():
