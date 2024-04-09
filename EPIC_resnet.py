@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 import json
+import wandb
 import torch
 import torchaudio
 import torchvision
@@ -32,13 +33,12 @@ from utils.utils import *
 from utils.datasets import AudioDataset
 from torch.optim.lr_scheduler import *
 import argparse
-
 parser = argparse.ArgumentParser(description='BlindCamera_args')
 parser.add_argument('--annotation_path', default='/mnt/storage/home/qc19291/scratch/EPIC/epic-kitchens-100-annotations/', type=str,
                     help='folder containing EPIC annotations')
 parser.add_argument('--data_path', default='/mnt/storage/home/qc19291/scratch/EPIC/EPIC_audio.hdf5', type=str,
                     help='folder containing EPIC data')
-parser.add_argument('--epochs', default = 32, type=int, help='number of epochs')
+parser.add_argument('--epochs', default = 100, type=int, help='number of epochs')
 parser.add_argument('--batch_size', default = 32, type=int, help='Batch size')
 parser.add_argument('--print_freq', default=10, type=int, help="print stats frequency")
 parser.add_argument('--eval_freq', default=5, type=int, help="val evaluation frequency")
@@ -66,9 +66,16 @@ parser.add_argument('--ops', default='SGD', type=str, choices=['SGD','Adam','Ada
 args = parser.parse_args()
 print(args)
 
+
+run = wandb.init(
+    # Set the project where this run will be logged
+    project="BlindCamera",
+    # Track hyperparameters and run metadata
+)
+
 os.environ["CUDA_VISIBLE_DEVICES"] = ", ".join(map(str, list(range(0, args.ngpus))))
 torch.cuda.empty_cache()
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #device = torch.device(torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
 
 train_csv = args.annotation_path + 'EPIC_100_train.pkl'
@@ -103,7 +110,7 @@ def validate(net, epoch, checkpoint=None):
 
     net.eval()
     end = time.time()
-    
+    val_step = 0 
     for batch_idx, (inputs, targets) in enumerate(VAL_LOADER):
         with torch.no_grad():
             # measure data loading time
@@ -134,9 +141,15 @@ def validate(net, epoch, checkpoint=None):
             batch_time.update(time.time() - end)
             end = time.time()
             
-            writer.add_scalar('loss/val', losses.val, epoch * len(TRAIN) + batch_idx)
-            writer.add_scalar('error/val', top1.val, epoch * len(TRAIN) + batch_idx)
-        
+            writer.add_scalar('loss/val', losses.val, epoch * len(VAL) + batch_idx)
+            writer.add_scalar('error/val', top1.val, epoch * len(VAL) + batch_idx)
+            val_step = batch_idx * (epoch +1)
+            wandb.log({"Val_Step": val_step,
+                   "Val_Epoch": epoch,
+                   "Val_Loss": losses.val,
+                   "Val_Error@1": top1.val,
+                   "Val_Error@5": top5.val})
+
             if batch_idx % args.print_freq == 0:
                 print('Validate:[{0}/{1}]\t'
                       'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
@@ -311,6 +324,11 @@ for epoch in range(args.epochs):  # loop over the dataset multiple times
         writer.add_scalar('loss/train', losses.val, epoch * len(TRAIN) + batch_idx)
         writer.add_scalar('error/train', top1.val, epoch * len(TRAIN) + batch_idx)
                           
+        wandb.log({"Epoch": epoch,
+                   "Loss": losses.val,
+                   "Error@1": top1.val,
+                   "Error@5": top5.val})
+
         if batch_idx % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
